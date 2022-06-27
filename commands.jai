@@ -327,27 +327,27 @@ cmd_marker :: (state: *Twitch_Chat, chan: string, comment: string) -> bool {
 
 // Requests the tags capability from the Twitch server.
 cmd_req_tags :: (state: *Twitch_Chat) -> bool {
-	return send_message(state, "CAP REQ: twitch.tv/tags\r\n");
+	return send_message(state, "CAP REQ :twitch.tv/tags\r\n");
 }
 
 // Requests the membership capability from the Twitch server.
 cmd_req_membership :: (state: *Twitch_Chat) -> bool {
-	return send_message(state, "CAP REQ: twitch.tv/membership\r\n");
+	return send_message(state, "CAP REQ :twitch.tv/membership\r\n");
 }
 
 // Requests the commands capability from the Twitch server.
 cmd_req_commands :: (state: *Twitch_Chat) -> bool {
-	return send_message(state, "CAP REQ: twitch.tv/commands\r\n");
+	return send_message(state, "CAP REQ :twitch.tv/commands\r\n");
 }
 
 // Requests the chatrooms capability from the Twitch server.
 cmd_req_chatrooms :: (state: *Twitch_Chat) -> bool {
-	return send_message(state, "CAP REQ: twitch.tv/tags twitch.tv/commands\r\n");
+	return send_message(state, "CAP REQ :twitch.tv/tags twitch.tv/commands\r\n");
 }
 
 // Requests the tags, membership, commands and chatrooms capabilities.
 cmd_req_all :: (state: *Twitch_Chat) -> bool {
 	return send_message(state, 
-	    "CAP REQ: twitch.tv/tags twitch.tv/commands twitch.tv/membership\r\n");
+	    "CAP REQ :twitch.tv/tags twitch.tv/commands twitch.tv/membership\r\n");
 }
 

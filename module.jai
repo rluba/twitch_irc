@@ -116,16 +116,121 @@ init :: (s: *Twitch_Chat, callback: Event_Callback, verbose := false) {
     s.verbose = verbose;
 }
 
-close_and_reset :: (handle: *s32) {
-    result := close(<<handle);
-    if !result {
-        error_code, error_string := get_error_value_and_string();
-        log_error("Could not close handle %: % %", <<handle, error_code, error_string);
-    }
-    <<handle = -1;
+deinit :: (s: *Twitch_Chat) {
+    disconnect(s);
+	array_free(s.buffer);
 }
 
-update :: (s: *Twitch_Chat, timeout_ms: int) -> bool {
+connect :: (s: *Twitch_Chat, nickname: string, password: string, hostname := "irc.chat.twitch.tv", port := "6667") -> bool {
+    if s.verbose then log("Connecting to %:% as %…", hostname, port, nickname);
+	// Create socket
+    s.socket = socket(AF_INET, SOCK_STREAM, 0);
+    if s.socket == -1 {
+        error_code, error_string := get_error_value_and_string();
+        log_error("Could not create socket: % %", error_code, error_string);
+        return false;
+    }
+
+    result := fcntl(s.socket, F_SETFL, fcntl(s.socket, F_GETFL) | O_NONBLOCK);
+    if result == -1 {
+        error_code, error_string := get_error_value_and_string();
+        log_error("Could not set socket to non-blocking: % %", error_code, error_string);
+        close_and_reset(*s.socket);
+        return false;
+    }
+
+    #if OS == .LINUX {
+        s.epoll_handle = epoll_create(1);
+        if s.epoll_handle < 0 {
+            error_code, error_string := get_error_value_and_string();
+            log_error("Could not create epoll instance: % %", error_code, error_string);
+            disconnect(s);
+            return false;
+        }
+
+        // Set up the epoll instance
+        eev: epoll_event;
+        eev.data.ptr = s;
+        eev.events = EPOLLRDHUP | EPOLLOUT | EPOLLIN | EPOLLET;
+        result = epoll_ctl(s.epoll_handle, EPOLL_CTL_ADD, s.socket, *eev);
+        if result {
+            error_code, error_string := get_error_value_and_string();
+            log_error("Could not configure epoll instance: % %", error_code, error_string);
+            disconnect(s);
+            return -1;
+        }
+
+    } else {
+        s.kevent_queue = kqueue();
+        if s.kevent_queue == -1 {
+            error_code, error_string := get_error_value_and_string();
+            log_error("Could not create event queue: % %", error_code, error_string);
+            disconnect(s);
+            return false;
+        }
+
+        INTERESTING_EVENTS :: Kevent_Filter.[.READ, .WRITE];
+        events: [INTERESTING_EVENTS.count] Kevent64;
+        for INTERESTING_EVENTS {
+            events[it_index].ident = cast(u64) s.socket;
+            events[it_index].filter = it;
+            events[it_index].flags = .ADD;
+        }
+
+        result = kevent64(s.kevent_queue, events.data, events.count, null, 0, 0, null);
+        if result == -1 {
+            error_code, error_string := get_error_value_and_string();
+            log_error("Could not register events with the event queue: % %", error_code, error_string);
+            disconnect(s);
+            return false;
+        }
+    }
+
+	// Connect the socket (and handle a possible connection error)
+    hints: addrinfo;
+	hints.ai_family   = AF_INET;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_protocol = IPPROTO_TCP;
+
+    info: *addrinfo;
+    defer {
+        if info then freeaddrinfo(info);
+    }
+    c_hostname := temp_c_string(hostname);
+    c_port := temp_c_string(port);
+    result = getaddrinfo(c_hostname, c_port, *hints, *info);
+    if result {
+        error_code, error_string := get_error_value_and_string();
+        log_error("Could not get addr info: % %", error_code, error_string);
+        disconnect(s);
+		return false;
+	}
+
+    con := connect(s.socket, info.ai_addr, info.ai_addrlen);
+
+    if con == -1 {
+        error_code := errno();
+        if error_code != EINPROGRESS && error_code != EALREADY {
+            error_string := get_error_string(error_code);
+            log_error("Could not connect to host %:%: % %", hostname, port, error_code, error_string);
+            disconnect(s);
+            return false;
+        }
+    }
+
+	s.status = .CONNECTING;
+    s.login.nickname = copy_string(nickname);
+    s.login.password = copy_string(password);
+	return true;
+}
+
+quit_and_disconnect :: (s: *Twitch_Chat) -> bool {
+	if !cmd_quit(s) then return false; 
+    disconnect(s);
+    return true;
+}
+
+update :: (s: *Twitch_Chat, timeout_ms := -1) -> bool {
     #if OS == .LINUX {
         epev: epoll_event;
         
@@ -241,14 +346,16 @@ update :: (s: *Twitch_Chat, timeout_ms: int) -> bool {
             return false;
         }
 
-        for 0..num_events-1 {
-            event := events[it];
+        for i: 0..num_events-1 {
+            event := events[i];
+
             if event.filter == {
                 case .READ;
                     success := read_and_process_data(s);
                     if !success then return false;
 
                     if event.flags & .EOF {
+                        if s.verbose then log("Connection got closed");
                         s.error = .CONN_CLOSED;
                         disconnect(s);
                         return false;
@@ -257,6 +364,20 @@ update :: (s: *Twitch_Chat, timeout_ms: int) -> bool {
                     // If we weren't connected yet, we seem to be now!
                     if s.status & .CONNECTING {		
                         s.status = .CONNECTED;
+
+                        // Remove the write event from the kevent queue, because we only used it to know when we are connected.
+                        events: [1] Kevent64;
+                        events[0].ident = cast(u64) s.socket;
+                        events[0].filter = .WRITE;
+                        events[0].flags = .DELETE;
+                        result := kevent64(s.kevent_queue, events.data, events.count, null, 0, 0, null);
+                        if result == -1 {
+                            error_code, error_string := get_error_value_and_string();
+                            log_error("Could not remove WRITE event from the event queue: % %", error_code, error_string);
+                            disconnect(s);
+                            return false;
+                        }
+
                         capreq(s);
                         auth(s);
                     }
@@ -292,12 +413,15 @@ read_and_process_data :: (s: *Twitch_Chat) -> bool {
             return false;
         }
 
+        if s.verbose then log("Read % bytes", bytes_received);
+
         if bytes_received == 0 then break;
 
         s.unconsumed_bytes += bytes_received;
 
         success, bytes_consumed := process_data(s, array_view(s.buffer, 0, s.unconsumed_bytes));
         s.unconsumed_bytes -= bytes_consumed;
+
         // @ToDo: should be a memmove! But we don't have that yet?
         for i: 0..s.unconsumed_bytes-1 {
             s.buffer[i] = s.buffer[bytes_consumed + i];
@@ -310,20 +434,22 @@ read_and_process_data :: (s: *Twitch_Chat) -> bool {
 }
 
 process_data :: (s: *Twitch_Chat, buf: [] u8) -> bool, bytes_consumed: int {
+    bytes_consumed: int;
     remaining := cast (string) buf;
+    // if s.verbose then log("Trying to process: %", remaining);
     found: bool;
     message: string;
     while true {
         found, message, remaining = split_from_left(remaining, "\r\n");
-        if !found {
-            break;
-        }
+        if !found then break;
+
+        bytes_consumed += message.count + 2;
 
         success := process_msg(s, message);
-        if !success return false, remaining.data - buf.data;
+        if !success then return false, bytes_consumed;
     }
 
-    return true, remaining.data - buf.data;
+    return true, bytes_consumed;
 }
 
 process_msg :: (s: *Twitch_Chat, message: string) -> bool {
@@ -416,17 +542,12 @@ parse_prefix :: (message: string) -> success: bool, prefix: string, remainder: s
 
 parse_command :: (message: string) -> command: string, command_args: [] string, remainder: string {
     found, command_string, after_command := split_from_left(message, ":");
-    if !found {
-        command_string = message;
-    }
 
     command: string;
     remainder: string;
     found, command, remainder = split_from_left(command_string, " ");
-    if !found {
-        command = command_string;
-    }
 
+    remainder = trim(remainder);
     return command, split(remainder, " "), after_command;
 }
 
@@ -464,15 +585,7 @@ parse_nick :: (prefix: string) -> string {
 
 // Requests all supported capabilities from the Twitch servers.
 capreq :: (s: *Twitch_Chat) -> bool {
-	// TODO chatrooms cap currently not implemented!
-	//      Once that's done, use the following line
-	//      in favor of the other boongawoonga here.
-	// return cmd_req_all(s);
-
-    success :=  cmd_req_tags(s);
-	success &&= cmd_req_membership(s);
-	success &&= cmd_req_commands(s);
-    return success;
+    return cmd_req_all(s);
 }
 
 // Authenticates with the Twitch Server using the NICK and PASS commands.
@@ -596,131 +709,46 @@ channel_command :: (event: *Twitch_Event, type: Command_Type) {
     }
 }
 
-
 send_message :: (s: *Twitch_Chat, message: string) -> success: bool {
     assert(ends_with(message, "\r\n"));
 
-    remaining := message;
-    while remaining {
+    if s.verbose then log("Sending message: %", get_message_safe_for_logging(s, message));
+
+    remainder := message;
+    while remainder {
         // Actually send the message
         result := send(s.socket, message.data, cast(u64) message.count, 0);
         if result == -1 {
             error_code, error_string := get_error_value_and_string();
-            log_error("Could not send message: % %\n\tRemaining message was: %", error_code, error_string, remaining);
+            // Let’s not doxx ourselves
+            safe_message := get_message_safe_for_logging(s, message);
+            safe_remainder := slice(safe_message, message.count - remainder.count, remainder.count);
+            log_error("Could not send message: % %\n\tRemaining message was: %", error_code, error_string, safe_remainder);
             return false;
         }
-        remaining = slice(remaining, result, remaining.count - result);
+        remainder = slice(remainder, result, remainder.count - result);
     }
 
     return true;
 }
 
-connect :: (s: *Twitch_Chat, hostname: string, port: string, nickname: string, password: string) -> bool {
-	// Create socket
-    s.socket = socket(AF_INET, SOCK_STREAM, 0);
-    if s.socket == -1 {
-        error_code, error_string := get_error_value_and_string();
-        log_error("Could not create socket: % %", error_code, error_string);
-        return false;
+get_message_safe_for_logging :: (s: *Twitch_Chat, message: string) -> string {
+    password_index := find_index_from_left(message, s.login.password);
+    if !password_index return message;
+
+    safe_message := copy_temporary_string(message);
+    while password_index != -1 {
+        for i: 0..s.login.password.count-1 {
+            safe_message[password_index + i] = #char "*";
+        }
+        password_index = find_index_from_left(safe_message, s.login.password);
     }
 
-    result := fcntl(s.socket, F_SETFL, fcntl(s.socket, F_GETFL) | O_NONBLOCK);
-    if result == -1 {
-        error_code, error_string := get_error_value_and_string();
-        log_error("Could not set socket to non-blocking: % %", error_code, error_string);
-        close_and_reset(*s.socket);
-        return false;
-    }
-
-    #if OS == .LINUX {
-        s.epoll_handle = epoll_create(1);
-        if s.epoll_handle < 0 {
-            error_code, error_string := get_error_value_and_string();
-            log_error("Could not create epoll instance: % %", error_code, error_string);
-            disconnect(s);
-            return false;
-        }
-
-        // Set up the epoll instance
-        eev: epoll_event;
-        eev.data.ptr = s;
-        eev.events = EPOLLRDHUP | EPOLLOUT | EPOLLIN | EPOLLET;
-        result = epoll_ctl(s.epoll_handle, EPOLL_CTL_ADD, s.socket, *eev);
-        if result {
-            error_code, error_string := get_error_value_and_string();
-            log_error("Could not configure epoll instance: % %", error_code, error_string);
-            disconnect(s);
-            return -1;
-        }
-
-    } else {
-        s.kevent_queue = kqueue();
-        if s.kevent_queue == -1 {
-            error_code, error_string := get_error_value_and_string();
-            log_error("Could not create event queue: % %", error_code, error_string);
-            disconnect(s);
-            return false;
-        }
-
-        events: [1] Kevent64;
-        events[0].ident = cast(u64) s.socket;
-        events[0].filter = Kevent_Filter.READ | .WRITE;
-        events[0].flags = .ADD;
-
-        result = kevent64(s.kevent_queue, events.data, events.count, null, 0, 0, null);
-        if result == -1 {
-            error_code, error_string := get_error_value_and_string();
-            log_error("Could not register events with the event queue: % %", error_code, error_string);
-            disconnect(s);
-            return false;
-        }
-    }
-
-	// Connect the socket (and handle a possible connection error)
-    hints: addrinfo;
-	hints.ai_family   = AF_INET;
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_protocol = IPPROTO_TCP;
-
-    info: *addrinfo;
-    defer {
-        if info then freeaddrinfo(info);
-    }
-    c_hostname := temp_c_string(hostname);
-    c_port := temp_c_string(port);
-    result = getaddrinfo(c_hostname, c_port, *hints, *info);
-    if result {
-        error_code, error_string := get_error_value_and_string();
-        log_error("Could not get addr info: % %", error_code, error_string);
-        disconnect(s);
-		return false;
-	}
-
-    con := connect(s.socket, info.ai_addr, info.ai_addrlen);
-
-    if con == -1 {
-        error_code := errno();
-        if error_code != EINPROGRESS && error_code != EALREADY {
-            error_string := get_error_string(error_code);
-            log_error("Could not connect to host %:%: % %", hostname, port, error_code, error_string);
-            disconnect(s);
-            return false;
-        }
-    }
-
-	s.status = .CONNECTING;
-    s.login.nickname = copy_string(nickname);
-    s.login.password = copy_string(password);
-	return true;
-}
-
-quit_and_disconnect :: (s: *Twitch_Chat) -> bool {
-	if !cmd_quit(s) then return false; 
-    disconnect(s);
-    return true;
+    return safe_message;
 }
 
 disconnect :: (s: *Twitch_Chat) {
+    if s.verbose then log("Disconnecting…");
     s.status = .DISCONNECTED;
     #if OS == .LINUX {
         close_and_reset(*s.epoll_handle);
@@ -730,11 +758,6 @@ disconnect :: (s: *Twitch_Chat) {
     }
     close_and_reset(*s.socket);
     deinit(*s.login);
-}
-
-deinit :: (s: *Twitch_Chat) {
-    disconnect(s);
-	array_free(s.buffer);
 }
 
 deinit :: (login: *Twitch_Login) {
@@ -776,6 +799,19 @@ get_tag_value :: (tags: [] Twitch_Tag, key: string) -> string {
 }
 
 #scope_file 
+
+close_and_reset :: (handle: *s32) {
+    result := close(<<handle);
+    if !result {
+        error_code := errno();
+        if error_code != EINPROGRESS && error_code != EWOULDBLOCK { // Closing is also non-blocking on non-blocking sockets. Sigh… Maybe we should change it to blocking before we close it? Maybe it doesn't matter…
+            error_string := get_error_string(error_code);
+            log_error("Could not close handle %: % %", <<handle, error_code, error_string);
+        }
+    }
+    <<handle = -1;
+}
+
 
 socket_is_connected :: (socket: s32) -> bool {
     err: s32;
