@@ -413,7 +413,7 @@ read_and_process_data :: (s: *Twitch_Chat) -> bool {
             return false;
         }
 
-        if s.verbose then log("Read % bytes", bytes_received);
+        // if s.verbose then log("Read % bytes", bytes_received);
 
         if bytes_received == 0 then break;
 
