@@ -131,7 +131,9 @@ connect :: (s: *Twitch_Chat, nickname: string, password: string, hostname := "ir
         return false;
     }
 
-    result := fcntl(s.socket, F_SETFL, fcntl(s.socket, F_GETFL) | O_NONBLOCK);
+	fl_value := fcntl(s.socket, F_GETFL);
+	fl_value |= O_NONBLOCK;
+    result := fcntl(s.socket, F_SETFL, fl_value);
     if result == -1 {
         error_code, error_string := get_error_value_and_string();
         log_error("Could not set socket to non-blocking: % %", error_code, error_string);
@@ -874,5 +876,6 @@ unescape :: (value_pointer: *string) {
 
 #import "Basic";
 #import "POSIX";
-#import "String";
 #import "Process";
+#import "String";
+#import "System";
