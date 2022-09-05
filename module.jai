@@ -879,3 +879,6 @@ unescape :: (value_pointer: *string) {
 #import "Process";
 #import "String";
 #import "System";
+#if OS == .MACOS {
+    #import "macos";
+}
