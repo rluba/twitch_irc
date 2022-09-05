@@ -25,13 +25,14 @@ Error :: enum {
 
 TWITCH_BUFFER_SIZE :: 2048;
 
-Twitch_Chat :: struct {
+Twitch_Chat :: struct (Data_Type: Type) {
 	status:           Status = .DISCONNECTED;
 	buffer:           [] u8;                      // IRC message buffer
     unconsumed_bytes: int;
 	login:            Twitch_Login;
 	error:            Error;                         // Last error that occured
-    event_callback:   Event_Callback;
+    event_callback:   (event: Twitch_Event, data: *Data_Type);
+    event_callback_data: *Data_Type;
     verbose:          bool;
 
 	socket:           s32 = -1;
@@ -42,8 +43,6 @@ Twitch_Chat :: struct {
         kevent_queue: s32 = -1;
     }
 }
-
-Event_Callback :: #type (event: Twitch_Event);
 
 Twitch_Login :: struct {
     nickname: string;
@@ -110,18 +109,19 @@ Command_Type :: enum {
     CTCP_ACTION;
 }
 
-init :: (s: *Twitch_Chat, callback: Event_Callback, verbose := false) {
+init :: (s: *Twitch_Chat($T), callback: (event: Twitch_Event, data: *T), callback_data: *T, verbose := false) {
     s.buffer = NewArray(TWITCH_BUFFER_SIZE, u8, initialized = false);
     s.event_callback = callback;
+    s.event_callback_data = callback_data;
     s.verbose = verbose;
 }
 
-deinit :: (s: *Twitch_Chat) {
+deinit :: (s: *$T/Twitch_Chat) {
     disconnect(s);
 	array_free(s.buffer);
 }
 
-connect :: (s: *Twitch_Chat, nickname: string, password: string, hostname := "irc.chat.twitch.tv", port := "6667") -> bool {
+connect :: (s: *$T/Twitch_Chat, nickname: string, password: string, hostname := "irc.chat.twitch.tv", port := "6667") -> bool {
     if s.verbose then log("Connecting to %:% as %…", hostname, port, nickname);
 	// Create socket
     s.socket = socket(AF_INET, SOCK_STREAM, 0);
@@ -226,13 +226,13 @@ connect :: (s: *Twitch_Chat, nickname: string, password: string, hostname := "ir
 	return true;
 }
 
-quit_and_disconnect :: (s: *Twitch_Chat) -> bool {
+quit_and_disconnect :: (s: *$T/Twitch_Chat) -> bool {
 	if !cmd_quit(s) then return false; 
     disconnect(s);
     return true;
 }
 
-update :: (s: *Twitch_Chat, timeout_ms := -1) -> bool {
+update :: (s: *$T/Twitch_Chat, timeout_ms := -1) -> bool {
     #if OS == .LINUX {
         epev: epoll_event;
         
@@ -392,7 +392,7 @@ update :: (s: *Twitch_Chat, timeout_ms := -1) -> bool {
 	return true;
 }
 
-read_and_process_data :: (s: *Twitch_Chat) -> bool {
+read_and_process_data :: (s: *$T/Twitch_Chat) -> bool {
     // Fetch and process all available data from the socket
     while true {
         bytes_received := read(s.socket, s.buffer.data + s.unconsumed_bytes, cast(u64) (s.buffer.count - s.unconsumed_bytes));
@@ -435,7 +435,7 @@ read_and_process_data :: (s: *Twitch_Chat) -> bool {
     return true;
 }
 
-process_data :: (s: *Twitch_Chat, buf: [] u8) -> bool, bytes_consumed: int {
+process_data :: (s: *$T/Twitch_Chat, buf: [] u8) -> bool, bytes_consumed: int {
     bytes_consumed: int;
     remaining := cast (string) buf;
     // if s.verbose then log("Trying to process: %", remaining);
@@ -454,7 +454,7 @@ process_data :: (s: *Twitch_Chat, buf: [] u8) -> bool, bytes_consumed: int {
     return true, bytes_consumed;
 }
 
-process_msg :: (s: *Twitch_Chat, message: string) -> bool {
+process_msg :: (s: *$T/Twitch_Chat, message: string) -> bool {
     if s.verbose then log("Message: %", message);
     event: Twitch_Event;
     event.raw = message;
@@ -586,7 +586,7 @@ parse_nick :: (prefix: string) -> string {
 }
 
 // Requests all supported capabilities from the Twitch servers.
-capreq :: (s: *Twitch_Chat) -> bool {
+capreq :: (s: *$T/Twitch_Chat) -> bool {
     return cmd_req_all(s);
 }
 
@@ -595,7 +595,7 @@ capreq :: (s: *Twitch_Chat) -> bool {
 // to wait for the server to reply. If the tags capability has been requested 
 // beforehand, the server will confirm login with the GLOBALUSERSTATE command,
 // otherwise just look out for the MOTD (starting with numeric command 001).
-auth :: (s: *Twitch_Chat) -> bool {
+auth :: (s: *$T/Twitch_Chat) -> bool {
 	if !cmd_pass(s, s.login.password)   return false;
 	if !cmd_nick(s, s.login.nickname)   return false;
 
@@ -603,7 +603,7 @@ auth :: (s: *Twitch_Chat) -> bool {
 	return true;
 }
 
-interpret_and_emit_event :: (s: *Twitch_Chat, event: *Twitch_Event) {
+interpret_and_emit_event :: (s: *$T/Twitch_Chat, event: *Twitch_Event) {
     if event.ctcp {
         if event.ctcp == {
             case "ACTION";
@@ -701,7 +701,7 @@ interpret_and_emit_event :: (s: *Twitch_Chat, event: *Twitch_Event) {
         }
     }
 
-    s.event_callback(event);
+    s.event_callback(event, s.event_callback_data);
 }
 
 channel_command :: (event: *Twitch_Event, type: Command_Type) {
@@ -711,7 +711,7 @@ channel_command :: (event: *Twitch_Event, type: Command_Type) {
     }
 }
 
-send_message :: (s: *Twitch_Chat, message: string) -> success: bool {
+send_message :: (s: *$T/Twitch_Chat, message: string) -> success: bool {
     assert(ends_with(message, "\r\n"));
 
     if s.verbose then log("Sending message: %", get_message_safe_for_logging(s, message));
@@ -734,7 +734,7 @@ send_message :: (s: *Twitch_Chat, message: string) -> success: bool {
     return true;
 }
 
-get_message_safe_for_logging :: (s: *Twitch_Chat, message: string) -> string {
+get_message_safe_for_logging :: (s: *$T/Twitch_Chat, message: string) -> string {
     password_index := find_index_from_left(message, s.login.password);
     if !password_index return message;
 
@@ -749,7 +749,7 @@ get_message_safe_for_logging :: (s: *Twitch_Chat, message: string) -> string {
     return safe_message;
 }
 
-disconnect :: (s: *Twitch_Chat) {
+disconnect :: (s: *$T/Twitch_Chat) {
     if s.verbose then log("Disconnecting…");
     s.status = .DISCONNECTED;
     #if OS == .LINUX {
@@ -769,19 +769,19 @@ deinit :: (login: *Twitch_Login) {
     free(login.id);           login.id = "";
 }
 
-is_connecting :: (state: *Twitch_Chat) -> bool {
+is_connecting :: (state: *$T/Twitch_Chat) -> bool {
 	return (state.status & .CONNECTING) != 0;
 }
 
-is_connected :: (state: *Twitch_Chat) -> bool {
+is_connected :: (state: *$T/Twitch_Chat) -> bool {
 	return (state.status & .CONNECTED) != 0;
 }
 
-is_logging_in :: (state: *Twitch_Chat) -> bool {
+is_logging_in :: (state: *$T/Twitch_Chat) -> bool {
 	return (state.status & .AUTHENTICATING) != 0;
 }
 
-is_logged_in :: (state: *Twitch_Chat) -> bool {
+is_logged_in :: (state: *$T/Twitch_Chat) -> bool {
 	return (state.status & .AUTHENTICATED) != 0;
 }
 
