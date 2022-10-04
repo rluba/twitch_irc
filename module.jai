@@ -124,18 +124,18 @@ deinit :: (s: *$T/Twitch_Chat) {
 connect :: (s: *$T/Twitch_Chat, nickname: string, password: string, hostname := "irc.chat.twitch.tv", port := "6667") -> bool {
     if s.verbose then log("Connecting to %:% as %…", hostname, port, nickname);
 	// Create socket
-    s.socket = socket(AF_INET, SOCK_STREAM, 0);
+    s.socket = socket(AF_INET, .STREAM, 0);
     if s.socket == -1 {
-        error_code, error_string := get_error_value_and_string();
+        error_code := get_last_socket_error();
+        error_string := get_error_string(error_code);
         log_error("Could not create socket: % %", error_code, error_string);
         return false;
     }
 
-	fl_value := fcntl(s.socket, F_GETFL);
-	fl_value |= O_NONBLOCK;
-    result := fcntl(s.socket, F_SETFL, fl_value);
-    if result == -1 {
-        error_code, error_string := get_error_value_and_string();
+    success := set_blocking(s.socket, false);
+    if !success {
+        error_code := get_last_socket_error();
+        error_string := get_error_string(error_code);
         log_error("Could not set socket to non-blocking: % %", error_code, error_string);
         close_and_reset(*s.socket);
         return false;
@@ -179,7 +179,7 @@ connect :: (s: *$T/Twitch_Chat, nickname: string, password: string, hostname := 
             events[it_index].flags = .ADD;
         }
 
-        result = kevent64(s.kevent_queue, events.data, events.count, null, 0, 0, null);
+        result := kevent64(s.kevent_queue, events.data, events.count, null, 0, 0, null);
         if result == -1 {
             error_code, error_string := get_error_value_and_string();
             log_error("Could not register events with the event queue: % %", error_code, error_string);
@@ -191,8 +191,8 @@ connect :: (s: *$T/Twitch_Chat, nickname: string, password: string, hostname := 
 	// Connect the socket (and handle a possible connection error)
     hints: addrinfo;
 	hints.ai_family   = AF_INET;
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_protocol = IPPROTO_TCP;
+	hints.ai_socktype = .STREAM;
+	hints.ai_protocol = .TCP;
 
     info: *addrinfo;
     defer {
@@ -875,6 +875,7 @@ unescape :: (value_pointer: *string) {
 #load "commands.jai";
 
 #import "Basic";
+#import "Socket";
 #import "POSIX";
 #import "Process";
 #import "String";
