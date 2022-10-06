@@ -20,7 +20,6 @@ Error :: enum {
     CONN_CLOSED    :: -11; // Connection lost: peer closed it
     CONN_HANGUP    :: -12; // Connection lost: unexpectedly
     CONN_SOCKET    :: -13; // Connection lost: socket error
-    EPOLL_SIG      :: -14; // epoll_pwait() caught a signal
 }
 
 TWITCH_BUFFER_SIZE :: 2048;
@@ -276,17 +275,13 @@ update :: (s: *$T/Twitch_Chat, timeout_ms := -1) -> bool {
             // For this, we'll use tcpsock_status().
 
             // Set the error accordingly:
-            error_code := errno();
+            error_code := get_error_value();
             if error_code == EINTR {
-                s.error = .EPOLL_SIG;
-            } else {
-                s.error = .EPOLL_WAIT;
-            }
-            
-            // Were we connected previously but now seem to be disconnected?
-            if is_connected(s) && tcpsock_status(s.socket) == -1 {
-                disconnect(s);
-            }
+                // Got interrupted, try again.
+                return true;
+            } 
+
+            s.error = .EPOLL_WAIT;
             return false;
         }
         
@@ -343,8 +338,15 @@ update :: (s: *$T/Twitch_Chat, timeout_ms := -1) -> bool {
         events: [2] Kevent64;
         num_events := kevent64(s.kevent_queue, null, 0, events.data, events.count, 0, timeout_spec_pointer);
         if num_events == -1 {
-            error_code, error_string := get_error_value_and_string();
+            error_code := get_error_value();
+            if error_code == EINTR {
+                // Got interrupted, try again.
+                return true;
+            }
+
+            error_string := get_error_string(error_code);
             log_error("Could not read events from the event queue: % %\n", error_code, error_string);
+            s.error = .EPOLL_WAIT;
             return false;
         }
 
