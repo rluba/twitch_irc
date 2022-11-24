@@ -34,7 +34,7 @@ Twitch_Chat :: struct (Data_Type: Type) {
     event_callback_data: *Data_Type;
     verbose:          bool;
 
-	socket:           s32 = -1;
+    socket:           Socket = INVALID_SOCKET;
     #if OS == .LINUX {
         epoll_handle: s32 = -1;
     }
@@ -108,11 +108,15 @@ Command_Type :: enum {
     CTCP_ACTION;
 }
 
-init :: (s: *Twitch_Chat($T), callback: (event: Twitch_Event, data: *T), callback_data: *T, verbose := false) {
+init :: (s: *Twitch_Chat($T), callback: (event: Twitch_Event, data: *T), callback_data: *T, verbose := false) -> bool {
+    success := socket_init();
+    if !success return false;
+
     s.buffer = NewArray(TWITCH_BUFFER_SIZE, u8, initialized = false);
     s.event_callback = callback;
     s.event_callback_data = callback_data;
     s.verbose = verbose;
+    return true;
 }
 
 deinit :: (s: *$T/Twitch_Chat) {
@@ -123,7 +127,7 @@ deinit :: (s: *$T/Twitch_Chat) {
 connect :: (s: *$T/Twitch_Chat, nickname: string, password: string, hostname := "irc.chat.twitch.tv", port := "6667") -> bool {
     if s.verbose then log("Connecting to %:% as %…", hostname, port, nickname);
 	// Create socket
-    s.socket = socket(AF_INET, .STREAM, 0);
+    s.socket = socket(AF_INET, .STREAM, .TCP);
     if s.socket == -1 {
         error_code := get_last_socket_error();
         error_string := get_error_string(error_code);
@@ -193,12 +197,9 @@ connect :: (s: *$T/Twitch_Chat, nickname: string, password: string, hostname := 
 	hints.ai_socktype = .STREAM;
 	hints.ai_protocol = .TCP;
 
-    info: *addrinfo;
-    defer {
-        if info then freeaddrinfo(info);
-    }
     c_hostname := temp_c_string(hostname);
     c_port := temp_c_string(port);
+    info: *addrinfo;
     result = getaddrinfo(c_hostname, c_port, *hints, *info);
     if result {
         error_code, error_string := get_error_value_and_string();
@@ -206,9 +207,9 @@ connect :: (s: *$T/Twitch_Chat, nickname: string, password: string, hostname := 
         disconnect(s);
 		return false;
 	}
+    defer freeaddrinfo(info);
 
     con := connect(s.socket, info.ai_addr, info.ai_addrlen);
-
     if con == -1 {
         error_code := errno();
         if error_code != EINPROGRESS && error_code != EALREADY {
@@ -349,6 +350,12 @@ update :: (s: *$T/Twitch_Chat, timeout_ms := -1) -> bool {
             s.error = .EPOLL_WAIT;
             return false;
         }
+        if num_events > events.count {
+            // This happened when I attached the debugger while kevent64 was in progress. So let’s try to recover from that so that we can continue debugging next time?
+            error_code, error_string := get_error_value_and_string();
+            log_error("kevent64 returned something weird (%): % %\n", num_events, error_code, error_string);
+            return true;
+        }
 
         for i: 0..num_events-1 {
             event := events[i];
@@ -397,7 +404,7 @@ update :: (s: *$T/Twitch_Chat, timeout_ms := -1) -> bool {
 read_and_process_data :: (s: *$T/Twitch_Chat) -> bool {
     // Fetch and process all available data from the socket
     while true {
-        bytes_received := read(s.socket, s.buffer.data + s.unconsumed_bytes, cast(u64) (s.buffer.count - s.unconsumed_bytes));
+        bytes_received := recv(s.socket, s.buffer.data + s.unconsumed_bytes, cast(u64) (s.buffer.count - s.unconsumed_bytes), 0);
         if bytes_received == -1 {
             error_code := errno();
             if error_code == EAGAIN || error_code == EWOULDBLOCK {
@@ -419,7 +426,10 @@ read_and_process_data :: (s: *$T/Twitch_Chat) -> bool {
 
         // if s.verbose then log("Read % bytes", bytes_received);
 
-        if bytes_received == 0 then break;
+        if bytes_received == 0 {
+            log_error("Socket % was closed by the other side", s.socket);
+            return false;
+        }
 
         s.unconsumed_bytes += bytes_received;
 
