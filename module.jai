@@ -24,22 +24,29 @@ Error :: enum {
 
 TWITCH_BUFFER_SIZE :: 2048;
 
-Twitch_Chat :: struct (Data_Type: Type) {
-	status:           Status = .DISCONNECTED;
-	buffer:           [] u8;                      // IRC message buffer
-    unconsumed_bytes: int;
-	login:            Twitch_Login;
-	error:            Error;                         // Last error that occured
-    event_callback:   (event: Twitch_Event, data: *Data_Type);
-    event_callback_data: *Data_Type;
-    verbose:          bool;
+// On macOS the socket doesn’t ever signal EOF if the connection was closed by the other side
+// while the computer was in sleep mode. So we need to check manually.
+// Twitch should send a ping every 5 minutes. If it doesn't then the connection is broken.
+TIMEOUT_INTERVAL_SECONDS :: 5 * 60 + 15;
 
-    socket:           Socket = INVALID_SOCKET;
+Twitch_Chat :: struct (Data_Type: Type) {
+	status:              Status = .DISCONNECTED;
+	buffer:              [] u8;                      // IRC message buffer
+    unconsumed_bytes:    int;
+	login:               Twitch_Login;
+	error:               Error;                         // Last error that occured
+    event_callback:      (event: Twitch_Event, data: *Data_Type);
+    event_callback_data: *Data_Type;
+    verbose:             bool;
+
+    socket:              Socket = INVALID_SOCKET;
+    last_message_time:   Apollo_Time = APOLLO_TIME_INVALID;
+
     #if OS == .LINUX {
-        epoll_handle: s32 = -1;
+        epoll_handle:    s32 = -1;
     }
     #if OS == .MACOS {
-        kevent_queue: s32 = -1;
+        kevent_queue:    s32 = -1;
     }
 }
 
@@ -223,6 +230,8 @@ connect :: (s: *$T/Twitch_Chat, nickname: string, password: string, hostname := 
 	s.status = .CONNECTING;
     s.login.nickname = copy_string(nickname);
     s.login.password = copy_string(password);
+    s.last_message_time = current_time_monotonic();
+
 	return true;
 }
 
@@ -277,7 +286,7 @@ update :: (s: *$T/Twitch_Chat, timeout_ms := -1) -> bool {
 
             // Set the error accordingly:
             error_code := get_error_value();
-            if error_code == EINTR {
+            if error_code == EINTR || error_code == EAGAIN {
                 // Got interrupted, try again.
                 return true;
             } 
@@ -340,7 +349,7 @@ update :: (s: *$T/Twitch_Chat, timeout_ms := -1) -> bool {
         num_events := kevent64(s.kevent_queue, null, 0, events.data, events.count, 0, timeout_spec_pointer);
         if num_events == -1 {
             error_code := get_error_value();
-            if error_code == EINTR {
+            if error_code == EINTR || error_code == EAGAIN {
                 // Got interrupted, try again.
                 return true;
             }
@@ -397,6 +406,12 @@ update :: (s: *$T/Twitch_Chat, timeout_ms := -1) -> bool {
             }
         }
     }
+
+    seconds_since_last_message := to_seconds(current_time_monotonic() - s.last_message_time);
+    if seconds_since_last_message > TIMEOUT_INTERVAL_SECONDS {
+        log_error("Received no Twitch message for % seconds. Reconnecting…", seconds_since_last_message);
+        return false;
+    }
 	
 	return true;
 }
@@ -430,6 +445,8 @@ read_and_process_data :: (s: *$T/Twitch_Chat) -> bool {
             log_error("Socket % was closed by the other side", s.socket);
             return false;
         }
+
+        s.last_message_time = current_time_monotonic();
 
         s.unconsumed_bytes += bytes_received;
 
