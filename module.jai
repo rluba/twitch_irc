@@ -164,12 +164,12 @@ connect :: (s: *$T/Twitch_Chat, nickname: string, password: string, hostname := 
         eev: epoll_event;
         eev.data.ptr = s;
         eev.events = EPOLLRDHUP | EPOLLOUT | EPOLLIN | EPOLLET;
-        result = epoll_ctl(s.epoll_handle, EPOLL_CTL_ADD, s.socket, *eev);
+        result := epoll_ctl(s.epoll_handle, EPOLL_CTL_ADD, s.socket, *eev);
         if result {
             error_code, error_string := get_error_value_and_string();
             log_error("Could not configure epoll instance: % %", error_code, error_string);
             disconnect(s);
-            return -1;
+            return false;
         }
 
     } else {
@@ -241,7 +241,7 @@ quit_and_disconnect :: (s: *$T/Twitch_Chat) -> bool {
     return true;
 }
 
-update :: (s: *$T/Twitch_Chat, timeout_ms := -1) -> bool {
+update :: (s: *$T/Twitch_Chat, timeout_ms: s32 = -1) -> bool {
     #if OS == .LINUX {
         epev: epoll_event;
         
@@ -262,7 +262,7 @@ update :: (s: *$T/Twitch_Chat, timeout_ms := -1) -> bool {
         sigaddset(*sigset, SIGURG);   // default: ignore
         sigaddset(*sigset, SIGWINCH); // default: ignore
 
-        num_events = epoll_pwait(s.epoll_handle, *epev, 1, timeout_ms, *sigset);
+        num_events := epoll_pwait(s.epoll_handle, *epev, 1, timeout_ms, *sigset);
 
         // An error has occured
         if num_events == -1 {
@@ -309,7 +309,7 @@ update :: (s: *$T/Twitch_Chat, timeout_ms := -1) -> bool {
         if epev.events & EPOLLOUT {
             // If we weren't connected yet, we seem to be now!
             if s.status & .CONNECTING {		
-                status = .CONNECTED;
+                s.status = .CONNECTED;
                 capreq(s);
                 auth(s);
             }
