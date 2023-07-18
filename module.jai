@@ -144,9 +144,12 @@ connect :: (s: *$T/Twitch_Chat, nickname: string, password: string, hostname := 
 
     success := set_blocking(s.socket, false);
     if !success {
-        error_code := get_last_socket_error();
-        error_string := get_error_string(error_code);
-        log_error("Could not set socket to non-blocking: % %", error_code, error_string);
+        close_and_reset(*s.socket);
+        return false;
+    } 
+
+    success = set_keepalive(s.socket, true, idle_seconds_before_keepalive = 10, keepalive_interval_seconds = 5, num_keepalive_attempts = 4);
+    if !success {
         close_and_reset(*s.socket);
         return false;
     }
@@ -349,7 +352,7 @@ update :: (s: *$T/Twitch_Chat, timeout_ms: s32 = -1) -> bool {
         num_events := kevent64(s.kevent_queue, null, 0, events.data, events.count, 0, timeout_spec_pointer);
         if num_events == -1 {
             error_code := get_error_value();
-            if error_code == EINTR || error_code == EAGAIN {
+            if error_code == EINTR {
                 // Got interrupted, try again.
                 return true;
             }
@@ -368,6 +371,7 @@ update :: (s: *$T/Twitch_Chat, timeout_ms: s32 = -1) -> bool {
 
         for i: 0..num_events-1 {
             event := events[i];
+            log("Got event %", event);
 
             if event.filter == {
                 case .READ;
@@ -375,7 +379,7 @@ update :: (s: *$T/Twitch_Chat, timeout_ms: s32 = -1) -> bool {
                     if !success then return false;
 
                     if event.flags & .EOF {
-                        if s.verbose then log("Connection got closed");
+                        log("Connection got closed");
                         s.error = .CONN_CLOSED;
                         disconnect(s);
                         return false;
@@ -384,6 +388,8 @@ update :: (s: *$T/Twitch_Chat, timeout_ms: s32 = -1) -> bool {
                     // If we weren't connected yet, we seem to be now!
                     if s.status & .CONNECTING {		
                         s.status = .CONNECTED;
+                        capreq(s);
+                        auth(s);
 
                         // Remove the write event from the kevent queue, because we only used it to know when we are connected.
                         events: [1] Kevent64;
@@ -398,8 +404,6 @@ update :: (s: *$T/Twitch_Chat, timeout_ms: s32 = -1) -> bool {
                             return false;
                         }
 
-                        capreq(s);
-                        auth(s);
                     }
                 case;
                     log_error("Unexpected event: %", event);
@@ -407,12 +411,11 @@ update :: (s: *$T/Twitch_Chat, timeout_ms: s32 = -1) -> bool {
         }
     }
 
-    seconds_since_last_message := to_seconds(current_time_monotonic() - s.last_message_time);
-    if seconds_since_last_message > TIMEOUT_INTERVAL_SECONDS {
-        log_error("Received no Twitch message for % seconds. Reconnecting…", seconds_since_last_message);
+    if !socket_is_connected(s.socket) {
+        log_error("Socket is no longer connected");
         return false;
     }
-	
+
 	return true;
 }
 
@@ -833,7 +836,7 @@ get_tag_value :: (tags: [] Twitch_Tag, key: string) -> string {
 
 close_and_reset :: (handle: *s32) {
     result := close(<<handle);
-    if !result {
+    if result != 0 {
         error_code := errno();
         if error_code != EINPROGRESS && error_code != EWOULDBLOCK { // Closing is also non-blocking on non-blocking sockets. Sigh… Maybe we should change it to blocking before we close it? Maybe it doesn't matter…
             error_string := get_error_string(error_code);
