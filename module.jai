@@ -167,7 +167,7 @@ connect :: (s: *$T/Twitch_Chat, nickname: string, password: string, hostname := 
         eev: epoll_event;
         eev.data.ptr = s;
         eev.events = EPOLLRDHUP | EPOLLOUT | EPOLLIN | EPOLLET;
-        result := epoll_ctl(s.epoll_handle, EPOLL_CTL_ADD, s.socket, *eev);
+        result := epoll_ctl(s.epoll_handle, .ADD, s.socket, *eev);
         if result {
             error_code, error_string := get_error_value_and_string();
             log_error("Could not configure epoll instance: % %", error_code, error_string);
