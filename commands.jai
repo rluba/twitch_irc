@@ -37,7 +37,7 @@ cmd_pong :: (state: *Twitch_Chat, param: string) -> bool {
         append(*builder, param);
     }
     append(*builder, "\r\n");
-    msg := builder_to_string(*builder, temp);
+    msg := builder_to_string(*builder,, temp);
 	return send_message(state, msg);
 }
 
